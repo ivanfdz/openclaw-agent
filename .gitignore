@@ -1,11 +1,11 @@
-# Secretos reales: nunca al repo
+# Real secrets: never in the repo
 secrets.env
 
-# Estado del gateway. Trátalo como credenciales:
-# contiene openclaw.json, la SQLite con tokens OAuth en claro, y el .env con el gateway token.
+# Gateway state. Treat it as credentials:
+# it holds openclaw.json, the SQLite with OAuth tokens in cleartext, and the .env with the gateway token.
 state/
 workspace/
 auth-secrets/
 
-# Clon de upstream
+# Upstream clone
 repo/

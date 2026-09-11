@@ -1,221 +1,222 @@
 # openclaw-agent
 
-Un asistente de IA con acceso a shell, ficheros y navegador, al que le hablas por Telegram desde
-el móvil. Corre en un contenedor Docker aislado en tu propia máquina.
+An AI assistant with shell, filesystem and browser access that you talk to over Telegram from
+your phone. It runs in an isolated Docker container on your own machine.
 
-Este repo **no** es el agente: es la capa de despliegue y endurecimiento alrededor de
-[OpenClaw](https://github.com/openclaw/openclaw). Lo que aporta:
+This repo is **not** the agent: it's the deployment and hardening layer around
+[OpenClaw](https://github.com/openclaw/openclaw). What it adds:
 
-- **Un runbook en un `Makefile`.** Montaje desde cero en seis comandos, sin prompts interactivos.
-- **Estado fuera del contenedor.** Config, SQLite y workspace viven en este directorio; el
-  contenedor es desechable y se reemplaza en cada actualización de imagen sin perder nada.
-- **Endurecimiento de red.** El compose de upstream publica el Control UI en `0.0.0.0`; aquí se
-  reescribe para que escuche solo en loopback.
-- **Cierre del bot a un único dueño.** `make lockdown` fija la allowlist de Telegram a tu user id
-  y te hace operador explícito de los comandos privilegiados.
-- **Un verificador.** `make verify` falla si la configuración se ha quedado en un estado abierto.
-- **Gestión de secretos.** `secrets.env` fuera de git, sincronizado al `.env` que lee Compose por
-  un script que sobrevive a las reescrituras de `setup.sh`.
+- **A runbook in a `Makefile`.** Bootstrap from scratch in six commands, no interactive prompts.
+- **State outside the container.** Config, SQLite and workspace live in this directory; the
+  container is disposable and gets replaced on every image update without losing anything.
+- **Network hardening.** Upstream's compose publishes the Control UI on `0.0.0.0`; here it's
+  rewritten to listen on loopback only.
+- **The bot locked to a single owner.** `make lockdown` pins the Telegram allowlist to your user
+  id and makes you the explicit operator for privileged commands.
+- **A verifier.** `make verify` fails if the configuration has drifted into an open state.
+- **Secret handling.** `secrets.env` stays out of git, synced into the `.env` Compose reads by a
+  script that survives `setup.sh` rewriting that file.
 
-Todo lo que aprendimos peleándonos con el montaje está documentado en
-[Detalles que muerden](#detalles-que-muerden): cuotas de modelo, el heartbeat que se come el tier
-gratuito, colisiones de sesión entre CLI y Telegram.
+Everything learned the hard way while getting this running is written down in
+[Things that bite](#things-that-bite): model quotas, the heartbeat that eats the free tier,
+session collisions between the CLI and Telegram.
 
-## Por qué en Docker
+## Why Docker
 
-El agente ejecuta shell, lee y escribe ficheros y navega. En Docker el radio de daño queda
-acotado al contenedor: si algo se va de madre, no se lleva por delante tu `$HOME`.
-La imagen de upstream ya corre como usuario `node` (uid 1000), no root, con `no-new-privileges`
-y sin `NET_RAW`/`NET_ADMIN`.
+The agent runs shell commands, reads and writes files, and browses. In Docker the blast radius
+is bounded by the container: if something goes sideways, it doesn't take your `$HOME` with it.
+Upstream's image already runs as the `node` user (uid 1000), not root, with `no-new-privileges`
+and without `NET_RAW`/`NET_ADMIN`.
 
-## Requisitos
+## Requirements
 
-- Docker con Compose v2 ≥ 2.24 (el tag `!override` del hardening necesita esa versión)
+- Docker with Compose v2 ≥ 2.24 (the hardening file's `!override` tag needs that version)
 - `make`, `bash`, `curl`, `git`
-- Un bot de Telegram creado con [@BotFather](https://t.me/BotFather) (`/newbot`)
-- Una API key de un proveedor LLM: Anthropic, OpenAI o Google AI Studio
-- ~4 GB de disco para la imagen `latest-browser` (trae Chromium)
+- A Telegram bot created via [@BotFather](https://t.me/BotFather) (`/newbot`)
+- An LLM provider API key: Anthropic, OpenAI or Google AI Studio
+- ~4 GB of disk for the `latest-browser` image (it ships Chromium)
 
 ## Layout
 
 ```
 openclaw-agent/
-├── repo/                          clon de openclaw/openclaw (aquí vive el docker-compose.yml)
-├── state/                         -> /home/node/.openclaw   config + SQLite + .env del gateway
-├── workspace/                     -> workspace del agente
-├── auth-secrets/                  -> clave de recuperación de credenciales OAuth heredadas
-├── config.env                     tunables no sensibles
-├── secrets.env                    API keys y token del bot (gitignored)
-├── docker-compose.hardening.yml   publica los puertos solo en loopback
+├── repo/                          clone of openclaw/openclaw (holds the docker-compose.yml)
+├── state/                         -> /home/node/.openclaw   config + SQLite + the gateway's .env
+├── workspace/                     -> the agent's workspace
+├── auth-secrets/                  -> recovery key for inherited OAuth credentials
+├── config.env                     non-sensitive tunables
+├── secrets.env                    API keys and bot token (gitignored)
+├── docker-compose.hardening.yml   publishes ports on loopback only
 ├── Makefile                       runbook
 └── bin/                           sync-secrets.sh, verify.sh
 ```
 
-`repo/`, `state/`, `workspace/` y `auth-secrets/` están gitignored: el primero porque es un clon
-de upstream, los otros tres porque son estado local. Al clonar este repo tendrás que traerte
-`repo/` y dejar que el montaje cree el resto.
+`repo/`, `state/`, `workspace/` and `auth-secrets/` are gitignored: the first because it's a
+clone of upstream, the other three because they're local state. After cloning this repo you'll
+need to fetch `repo/` yourself and let the bootstrap create the rest.
 
-`state/` es material sensible. Los tokens OAuth se guardan en claro en la SQLite,
-así que trata ese directorio y sus copias de seguridad como credenciales.
+`state/` is sensitive material. OAuth tokens are stored in cleartext in the SQLite database, so
+treat that directory and any backups of it as credentials.
 
-## Montaje
+## Bootstrap
 
 ```bash
 git clone https://github.com/openclaw/openclaw.git repo
-cp secrets.env.example secrets.env     # rellena la API key y el token de @BotFather
-make setup                             # .env, permisos, arranque
-make onboard                           # registra el proveedor LLM, sin prompts
-make telegram-pairing                  # conecta el bot en modo pairing
-# escríbele al bot: su respuesta trae tu user id numérico
-make lockdown ID=<tu-user-id>          # cierra el bot a tu cuenta
+cp secrets.env.example secrets.env     # fill in the API key and the @BotFather token
+make setup                             # .env, permissions, start
+make onboard                           # register the LLM provider, no prompts
+make telegram-pairing                  # connect the bot in pairing mode
+# message the bot: its reply contains your numeric user id
+make lockdown ID=<your-user-id>        # lock the bot down to your account
 make verify
 ```
 
-`make setup` no construye la imagen: usa la prebuilt oficial `latest-browser`, que ya trae
-Chromium. Compilar desde fuente pediría 6 GB de RAM al builder y no aporta nada aquí.
+`make setup` doesn't build the image: it uses the official prebuilt `latest-browser`, which
+already ships Chromium. Building from source would ask 6 GB of RAM from the builder and buys
+nothing here.
 
-Opcional, para que el agente pueda buscar en la web: `make websearch`. Instala el plugin
-`parallel-free`, que no pide API key y devuelve extractos densos pensados para contexto de LLM.
-La otra opción sin key es `duckduckgo`, pero upstream la marca como experimental porque scrapea
-HTML sin JS y se rompe con los challenges anti-bot. Para filtros por país/idioma y más
-fiabilidad, el camino es Brave: `BRAVE_API_KEY` en `secrets.env` y `provider=brave`.
+Optional, so the agent can search the web: `make websearch`. It installs the `parallel-free`
+plugin, which needs no API key and returns dense extracts meant for LLM context. The other
+key-free option is `duckduckgo`, but upstream flags it as experimental because it scrapes HTML
+without JS and breaks against anti-bot challenges. For country/language filters and better
+reliability, use Brave: put `BRAVE_API_KEY` in `secrets.env` and set `provider=brave`.
 
-## El modelo de seguridad, en corto
+## The security model, briefly
 
-Un bot de Telegram es alcanzable por cualquiera que sepa su nombre de usuario. El bot tiene
-shell en el contenedor. Por lo tanto la única configuración aceptable para un bot de un solo
-dueño es `dmPolicy: allowlist` con tu user id numérico explícito en `allowFrom`.
+A Telegram bot is reachable by anyone who knows its username. The bot has shell access inside
+the container. So the only acceptable configuration for a single-owner bot is
+`dmPolicy: allowlist` with your numeric user id explicitly listed in `allowFrom`.
 
-- `pairing` (el default de upstream) es un estado de tránsito para descubrir tu user id.
-- `open` con `allowFrom: ["*"]` es un bot público. No lo uses aquí.
-- `make lockdown` fija además `commands.ownerAllowFrom` a `telegram:<tu-id>`, que es lo que
-  da operador explícito a los comandos privilegiados y a las aprobaciones de ejecución.
-- `make verify` falla si detecta `open`, un comodín en `allowFrom`, o un puerto publicado
-  fuera de loopback.
+- `pairing` (upstream's default) is a transit state for discovering your user id.
+- `open` with `allowFrom: ["*"]` is a public bot. Don't use it here.
+- `make lockdown` also pins `commands.ownerAllowFrom` to `telegram:<your-id>`, which is what
+  grants an explicit operator for privileged commands and execution approvals.
+- `make verify` fails if it finds `open`, a wildcard in `allowFrom`, or a port published outside
+  loopback.
 
-Aparte de eso: el contenido que el agente lee de la web o del correo es no confiable. Si una
-página trae texto con pinta de instrucciones, para el agente es un intento de inyección de
-prompt. Cuanto más acotadas estén las credenciales que le des, menos importa.
+Beyond that: content the agent reads from the web or from email is untrusted. If a page contains
+text that looks like instructions, treat it as a prompt injection attempt. The more narrowly
+scoped the credentials you hand it, the less it matters.
 
-## Día a día
+## Day to day
 
-| Qué | Comando |
+| What | Command |
 | --- | --- |
-| Arrancar / parar | `make up` / `make down` |
-| Recrear aplicando cambios de entorno | `make restart` |
+| Start / stop | `make up` / `make down` |
+| Recreate, applying environment changes | `make restart` |
 | Logs | `make logs` |
-| Sondas de salud | `make health` |
-| URL del Control UI | `make dashboard` |
-| Preflight de despliegue | `make doctor` |
-| Un comando del CLI | `make cli CMD='channels list'` |
-| Leer config | `make config-get P=channels.telegram` |
-| Actualizar imagen | `make update` |
+| Health probes | `make health` |
+| Control UI URL | `make dashboard` |
+| Deployment preflight | `make doctor` |
+| A single CLI command | `make cli CMD='channels list'` |
+| Read config | `make config-get P=channels.telegram` |
+| Update the image | `make update` |
 
-El Control UI queda en `http://127.0.0.1:18789/`. El token está en `repo/.env` como
-`OPENCLAW_GATEWAY_TOKEN`. `config get` lo redacta, así que léelo del fichero.
+The Control UI lands on `http://127.0.0.1:18789/`. Its token is in `repo/.env` as
+`OPENCLAW_GATEWAY_TOKEN`. `config get` redacts it, so read it from the file.
 
-`docker compose restart` no aplica cambios de entorno; por eso `make restart` hace
+`docker compose restart` does not apply environment changes; that's why `make restart` runs
 `up -d --force-recreate`.
 
-## Detalles que muerden
+## Things that bite
 
-**`setup.sh` reescribe `repo/.env` desde el entorno del shell** en cada ejecución. No edites
-`repo/.env` a mano esperando que sobreviva: los tunables van en `config.env` y los secretos en
-`secrets.env`. El script conserva las líneas cuyas claves no gestiona, y de eso se aprovecha
-`bin/sync-secrets.sh` para inyectar las claves de proveedor y de canal.
+**`setup.sh` rewrites `repo/.env` from the shell environment** on every run. Don't hand-edit
+`repo/.env` and expect it to survive: tunables go in `config.env`, secrets in `secrets.env`. The
+script preserves lines whose keys it doesn't manage, and `bin/sync-secrets.sh` exploits exactly
+that to inject the provider and channel keys.
 
-**`docker-compose.override.yml` no se auto-carga.** `setup.sh` invoca Compose con `-f`
-explícitos, lo que desactiva el descubrimiento automático del override. De ahí que el
-endurecimiento viva en `docker-compose.hardening.yml` y que el Makefile pase siempre la lista
-completa de ficheros. Si añades ficheros de Compose, mantén el mismo orden en todos los
-comandos o los mounts cambian bajo tus pies.
+**`docker-compose.override.yml` is not auto-loaded.** `setup.sh` invokes Compose with explicit
+`-f` flags, which disables automatic override discovery. Hence the hardening living in
+`docker-compose.hardening.yml` and the Makefile always passing the full file list. If you add
+Compose files, keep the same order in every command or the mounts shift under you.
 
-**Los servicios locales del host no están en `127.0.0.1`.** Dentro del contenedor esa
-dirección es el propio contenedor. Para Ollama o LM Studio corriendo en el Mac, usa
-`http://host.docker.internal:11434` y `:1234`; el compose ya mapea el alias.
+**Host-local services are not on `127.0.0.1`.** Inside the container that address is the
+container itself. For Ollama or LM Studio running on the Mac, use
+`http://host.docker.internal:11434` and `:1234`; the compose file already maps the alias.
 
-**Actualizaciones.** Las etiquetas móviles (`latest*`) se reconstruyen cada semana con parches
-de SO. El arranque aplica las migraciones de upgrade por sí solo. Si tras un cambio de imagen
-el contenedor se queda reiniciando, ejecuta `make doctor` contra el mismo estado montado.
+**Updates.** Rolling tags (`latest*`) are rebuilt weekly with OS patches. Startup applies
+upgrade migrations on its own. If the container ends up in a restart loop after an image change,
+run `make doctor` against the same mounted state.
 
-**Elegir modelo en Gemini tiene cuatro trampas.** `models list` mezcla el catálogo local del
-plugin con lo que el proveedor anuncia en vivo, y no todo lo listado es invocable. Verificado
-atacando la API directamente:
+**Picking a model on Gemini has four traps.** `models list` mixes the plugin's local catalog
+with what the provider advertises live, and not everything listed is actually callable. Verified
+by hitting the API directly:
 
-| Síntoma | Causa | Qué hacer |
+| Symptom | Cause | What to do |
 | --- | --- | --- |
-| 429 `RESOURCE_EXHAUSTED` | `gemini-3.1-pro-preview`, el que elige el onboarding, no entra en el tier gratuito | usar un `flash` |
-| `Unknown model` al invocar | el modelo sale en `models list` pero no está en el catálogo del plugin (p.ej. `gemini-3.8-flash`); `models set` lo acepta con un aviso que va en serio | elegir uno del catálogo |
-| 404 `no longer available to new users` | `gemini-2.5-flash` y `2.5-flash-lite` están retirados para cuentas nuevas | Google recomienda `gemini-3.6-flash` |
-| 503 `UNAVAILABLE`, high demand | `gemini-3.6-flash` y `3.7-flash` se saturan de forma intermitente | transitorio, pero no lo pongas como primario |
+| 429 `RESOURCE_EXHAUSTED` | `gemini-3.1-pro-preview`, the one onboarding picks, isn't in the free tier | use a `flash` |
+| `Unknown model` on call | the model appears in `models list` but isn't in the plugin catalog (e.g. `gemini-3.8-flash`); `models set` accepts it with a warning you should take seriously | pick one from the catalog |
+| 404 `no longer available to new users` | `gemini-2.5-flash` and `2.5-flash-lite` are retired for new accounts | Google recommends `gemini-3.6-flash` |
+| 503 `UNAVAILABLE`, high demand | `gemini-3.6-flash` and `3.7-flash` saturate intermittently | transient, but don't make it your primary |
 
-Configuración actual: primario `google/gemini-3.5-flash`, que es el que responde de forma
-estable, con `3.6-flash` y `3.7-flash` como fallbacks.
+Current setup: primary `google/gemini-3.5-flash`, the one that responds reliably, with
+`3.6-flash` and `3.7-flash` as fallbacks.
 
-**Limitación conocida de esa cadena de fallbacks:** los tres modelos son de Gemini. Sirve para
-un 503 de un modelo concreto, pero no para un 429 de cuota, que es del proyecto entero y tumba
-los tres a la vez. El arreglo de verdad es un fallback de otro proveedor: su key en
-`secrets.env` y `make cli CMD='models fallbacks add <proveedor>/<modelo>'`.
+**Known limitation of that fallback chain:** all three models are Gemini. It covers a 503 on one
+specific model, but not a 429 quota error, which is project-wide and takes all three down at
+once. The real fix is a fallback from another provider: its key in `secrets.env` plus
+`make cli CMD='models fallbacks add <provider>/<model>'`.
 
-**Diagnosticar fallos de modelo.** Para separar si el problema es el modelo, la cuota o
-OpenClaw, ataca la API a pelo. Usa el endpoint `v1`, no `v1beta`: en las pruebas `v1beta`
-devolvía 404 con cuerpo vacío mientras `v1` daba el JSON de error real. Y lanza las peticiones
-de una en una, porque en ráfaga también responde con cuerpos vacíos.
+**Diagnosing model failures.** To separate whether the problem is the model, the quota or
+OpenClaw, hit the API raw. Use the `v1` endpoint, not `v1beta`: in testing `v1beta` returned 404
+with an empty body while `v1` gave the real error JSON. And send requests one at a time, because
+in bursts it also returns empty bodies.
 
 ```bash
 curl -sS -X POST \
-  "https://generativelanguage.googleapis.com/v1/models/<modelo>:generateContent" \
+  "https://generativelanguage.googleapis.com/v1/models/<model>:generateContent" \
   -H "x-goog-api-key: $GEMINI_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"contents":[{"parts":[{"text":"hola"}]}]}'
+  -d '{"contents":[{"parts":[{"text":"hello"}]}]}'
 ```
 
-**El heartbeat se come la cuota gratuita.** OpenClaw crea tres automatizaciones de serie, y una
-de ellas, `Heartbeat (main)`, lanza un turno de agente **cada 30 minutos** por defecto. Son 48
-turnos al día que nadie ha pedido, contra el tier gratuito de tu proveedor. Es el principal
-candidato a que te aparezca un 429 sin haber hecho nada.
+**The heartbeat eats your free quota.** OpenClaw creates three automations out of the box, and
+one of them, `Heartbeat (main)`, fires an agent turn **every 30 minutes** by default. That's 48
+turns a day nobody asked for, against your provider's free tier. It's the prime suspect when a
+429 shows up without you doing anything.
 
-Aquí está desactivado con `agents.defaults.heartbeat.every = 0m`. Eso apaga solo la cadencia
-recurrente; los despertares puntuales por evento siguen disponibles. Para reactivarlo:
+Here it's disabled with `agents.defaults.heartbeat.every = 0m`. That only turns off the
+recurring cadence; event-driven wakeups still work. To re-enable:
 
 ```bash
 make cli CMD='config set agents.defaults.heartbeat.every 30m'
 ```
 
-Las otras dos automatizaciones son mucho más benignas: `Memory Dreaming Promotion` (diaria a
-las 03:00, en sesión aislada) y `Skill collection review` (semanal). Míralas con
+The other two automations are far more benign: `Memory Dreaming Promotion` (daily at 03:00, in
+an isolated session) and `Skill collection review` (weekly). Inspect them with
 `make cli CMD='cron list'`.
 
-**Las sesiones se comparten entre CLI y Telegram.** `agent:main:main` acumula como
-participantes tanto `cli` como `telegram:<tu-id>`. Si pruebas por CLI mientras el bot atiende
-un mensaje tuyo, chocan y sale `SESSION_WORK_START_CHANGED`. Peor: si matas un proceso del CLI
-a medias, la sesión se queda en `status: running` y bloquea también los mensajes de Telegram.
+**Sessions are shared between the CLI and Telegram.** `agent:main:main` accumulates both `cli`
+and `telegram:<your-id>` as participants. If you test via the CLI while the bot is handling a
+message from you, they collide and you get `SESSION_WORK_START_CHANGED`. Worse: if you kill a
+CLI process midway, the session stays `status: running` and blocks Telegram messages too.
 
-- Para diagnosticar sin molestar al bot, usa una sesión aparte:
+- To diagnose without disturbing the bot, use a separate session:
   `make cli CMD='agent --session-key agent:main:diag --message "..."'`
-- Para ver el estado: `make cli CMD='sessions list --json'`
-- Para soltar una reclamación rancia, `make restart` la limpia. No hace falta borrar la sesión.
+- To inspect state: `make cli CMD='sessions list --json'`
+- To release a stale claim, `make restart` clears it. No need to delete the session.
 
-Los mensajes entrantes de canal sí reintentan ante ese error por su cuenta
-(`src/channels/message/ingress-retry-policy.ts`), así que un choque puntual no te pierde el
-mensaje.
+Inbound channel messages do retry on that error by themselves
+(`src/channels/message/ingress-retry-policy.ts`), so an occasional collision won't lose the
+message.
 
-**Probar la salida sin tocar el móvil.** `message send` inyecta un mensaje por el canal sin
-pasar por el agente, útil para separar "el bot no llega a mi teléfono" de "el modelo falla":
+**Testing the outbound path without touching your phone.** `message send` injects a message
+through the channel without going through the agent, useful for separating "the bot isn't
+reaching my phone" from "the model is failing":
 
 ```bash
-make cli CMD='message send --channel telegram --target <tu-id> --message "prueba"'
+make cli CMD='message send --channel telegram --target <your-id> --message "test"'
 ```
 
-## Sobre automatizar compras (cine, etc.)
+## On automating purchases (cinema tickets, etc.)
 
-La parte de "hablarle por Telegram y que investigue" es sólida. La de "que compre" no, y no por
-el agente: las webs de venta van detrás de anti-bot, los mapas de asientos son canvas sin DOM
-semántico, y el pago con SCA pide un OTP que el agente no puede ni debe resolver.
+The "message it on Telegram and have it research" part is solid. The "have it buy" part isn't,
+and not because of the agent: ticketing sites sit behind anti-bot defenses, seat maps are canvas
+with no semantic DOM, and SCA payment asks for an OTP the agent cannot and should not resolve.
 
-El diseño que aguanta es que el agente investigue y te deje el checkout preparado, y que el
-último clic sea tuyo. Cualquier acción que mueva dinero, con confirmación humana explícita.
+The design that holds up is the agent researching and leaving the checkout ready, with the final
+click yours. Anything that moves money gets explicit human confirmation.
 
-## Licencia
+## License
 
-Este repo son scripts de despliegue. OpenClaw es un proyecto aparte con su propia licencia;
-consúltala en [openclaw/openclaw](https://github.com/openclaw/openclaw).
+This repo is deployment tooling. OpenClaw is a separate project with its own license; see
+[openclaw/openclaw](https://github.com/openclaw/openclaw).

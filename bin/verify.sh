@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Comprobaciones post-montaje. Falla en rojo si algo importante no está como debe.
-# Lo que más importa aquí es el bloque de seguridad: un bot de Telegram abierto
-# equivale a dar shell en este contenedor a cualquiera que encuentre el bot.
+# Post-bootstrap checks. Fails loudly if something important isn't as it should be.
+# The security block is what matters most here: an open Telegram bot is equivalent
+# to handing shell access in this container to anyone who finds the bot.
 set -uo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,65 +19,65 @@ COMPOSE+=(-f "$BASE_DIR/docker-compose.hardening.yml")
 fails=0
 ok() { printf '  \033[32mOK\033[0m    %s\n' "$1"; }
 bad() {
-  printf '  \033[31mFALLO\033[0m %s\n' "$1"
+  printf '  \033[31mFAIL\033[0m  %s\n' "$1"
   fails=$((fails + 1))
 }
-warn() { printf '  \033[33mAVISO\033[0m %s\n' "$1"; }
+warn() { printf '  \033[33mWARN\033[0m  %s\n' "$1"; }
 
-echo "== Contenedor =="
+echo "== Container =="
 state="$(docker inspect -f '{{.State.Status}}' openclaw-agent-openclaw-gateway-1 2>/dev/null)"
 if [[ "$state" == "running" ]]; then
-  ok "gateway corriendo"
-  hs="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}sin-healthcheck{{end}}' \
+  ok "gateway running"
+  hs="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' \
     openclaw-agent-openclaw-gateway-1 2>/dev/null)"
   case "$hs" in
     healthy) ok "healthcheck: healthy" ;;
-    starting) warn "healthcheck: starting (dale unos segundos)" ;;
+    starting) warn "healthcheck: starting (give it a few seconds)" ;;
     *) bad "healthcheck: $hs" ;;
   esac
 else
-  bad "gateway no está corriendo (estado: ${state:-inexistente})"
+  bad "gateway is not running (state: ${state:-nonexistent})"
 fi
 
-echo "== Sondas HTTP =="
+echo "== HTTP probes =="
 for probe in healthz startupz readyz; do
   if curl -fsS --max-time 10 "http://127.0.0.1:$PORT/$probe" >/dev/null 2>&1; then
-    ok "/$probe responde"
+    ok "/$probe responds"
   else
-    bad "/$probe no responde"
+    bad "/$probe does not respond"
   fi
 done
 
-echo "== Exposición de red =="
-# Cada binding publicado debe ir a loopback. Si aparece 0.0.0.0, el Control UI
-# está accesible desde la LAN y eso es control total del agente.
+echo "== Network exposure =="
+# Every published binding must go to loopback. If 0.0.0.0 shows up, the Control UI
+# is reachable from the LAN and that means full control of the agent.
 bindings="$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{range $conf}}{{$p}}={{.HostIp}}:{{.HostPort}} {{end}}{{end}}' \
   openclaw-agent-openclaw-gateway-1 2>/dev/null)"
 if [[ -z "$bindings" ]]; then
-  bad "no se pudieron leer los port bindings"
+  bad "could not read the port bindings"
 else
   exposed=0
   for b in $bindings; do
     hostip="${b#*=}"
     hostip="${hostip%:*}"
     if [[ "$hostip" != "127.0.0.1" && "$hostip" != "::1" ]]; then
-      bad "puerto publicado fuera de loopback: $b"
+      bad "port published outside loopback: $b"
       exposed=1
     fi
   done
-  [[ "$exposed" -eq 0 ]] && ok "todos los puertos publicados solo en loopback: $bindings"
+  [[ "$exposed" -eq 0 ]] && ok "all published ports on loopback only: $bindings"
 fi
 
-echo "== Proveedor LLM =="
+echo "== LLM provider =="
 models="$("${COMPOSE[@]}" run -T --rm openclaw-cli models list 2>&1)"
 if [[ -n "$models" ]] && ! grep -qi "no models\|error\|not configured" <<<"$models"; then
-  ok "el proveedor devuelve modelos"
+  ok "the provider returns models"
 else
-  bad "no hay proveedor de modelos usable (ejecuta: make onboard)"
+  bad "no usable model provider (run: make onboard)"
   sed 's/^/        /' <<<"$(head -5 <<<"$models")"
 fi
 
-echo "== Seguridad de Telegram =="
+echo "== Telegram security =="
 tg="$("${COMPOSE[@]}" run -T --rm openclaw-cli config get channels.telegram 2>&1)"
 dmpolicy="$(grep -oE '"dmPolicy"[[:space:]]*:[[:space:]]*"[a-z]+"' <<<"$tg" | grep -oE '"[a-z]+"$' | tr -d '"')"
 
@@ -86,38 +86,38 @@ case "$dmpolicy" in
     ok "dmPolicy = allowlist"
     if grep -qE '"allowFrom"' <<<"$tg"; then
       if grep -qE '"allowFrom"[^]]*"\*"' <<<"$tg"; then
-        bad "allowFrom contiene el comodín \"*\": el bot es público"
+        bad "allowFrom contains the \"*\" wildcard: the bot is public"
       else
-        ok "allowFrom con ids explícitos"
+        ok "allowFrom with explicit ids"
       fi
     else
-      bad "allowFrom vacío con dmPolicy allowlist: el bot bloquea todos los DMs"
+      bad "allowFrom is empty with dmPolicy allowlist: the bot blocks every DM"
     fi
     ;;
   pairing)
-    warn "dmPolicy = pairing. Estado transitorio para descubrir tu user id."
-    warn "Ciérralo con: make lockdown ID=<tu-user-id>"
+    warn "dmPolicy = pairing. Transient state for discovering your user id."
+    warn "Close it with: make lockdown ID=<your-user-id>"
     ;;
   open)
-    bad "dmPolicy = open. Cualquier cuenta de Telegram que encuentre el bot puede darle órdenes."
+    bad "dmPolicy = open. Any Telegram account that finds the bot can give it orders."
     ;;
   *)
-    bad "no se pudo leer channels.telegram.dmPolicy (¿canal sin configurar?)"
+    bad "could not read channels.telegram.dmPolicy (channel not configured?)"
     ;;
 esac
 
 owner="$("${COMPOSE[@]}" run -T --rm openclaw-cli config get commands.ownerAllowFrom 2>&1)"
 if grep -qE 'telegram:[0-9]+' <<<"$owner"; then
-  ok "commands.ownerAllowFrom apunta a una cuenta de Telegram concreta"
+  ok "commands.ownerAllowFrom points at a specific Telegram account"
 else
-  warn "commands.ownerAllowFrom sin cuenta de Telegram: comandos de owner y aprobaciones sin operador explícito"
+  warn "commands.ownerAllowFrom has no Telegram account: owner commands and approvals have no explicit operator"
 fi
 
 echo
 if [[ "$fails" -eq 0 ]]; then
-  echo -e "\033[32mTodo en orden.\033[0m Control UI: http://127.0.0.1:$PORT/"
-  echo "El token del Control UI está en repo/.env como OPENCLAW_GATEWAY_TOKEN."
+  echo -e "\033[32mAll good.\033[0m Control UI: http://127.0.0.1:$PORT/"
+  echo "The Control UI token is in repo/.env as OPENCLAW_GATEWAY_TOKEN."
 else
-  echo -e "\033[31m$fails comprobación(es) fallidas.\033[0m"
+  echo -e "\033[31m$fails check(s) failed.\033[0m"
   exit 1
 fi

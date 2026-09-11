@@ -1,12 +1,12 @@
-# Endurecimiento sobre el docker-compose.yml de upstream.
+# Hardening on top of upstream's docker-compose.yml.
 #
-# Por qué existe: el compose de upstream publica 18789 (Control UI), 18790 (bridge)
-# y 3978 (MS Teams) en 0.0.0.0, es decir accesibles desde cualquier equipo de tu LAN.
-# El Control UI da control total del agente. En un portátil que se conecta a wifis
-# ajenas eso no interesa.
+# Why it exists: upstream's compose publishes 18789 (Control UI), 18790 (bridge)
+# and 3978 (MS Teams) on 0.0.0.0, i.e. reachable from any machine on your LAN.
+# The Control UI grants full control of the agent. On a laptop that joins other
+# people's wifi, that's not what you want.
 #
-# `!override` reemplaza la lista de ports en vez de concatenarla (Compose >= 2.24).
-# Sin el tag acabarías con el binding a 0.0.0.0 Y el de loopback a la vez.
+# `!override` replaces the ports list instead of appending to it (Compose >= 2.24).
+# Without the tag you'd end up with the 0.0.0.0 binding AND the loopback one.
 services:
   openclaw-gateway:
     ports: !override
